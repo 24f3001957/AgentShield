@@ -1,0 +1,17 @@
+{
+  "name": "agentshield",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AgentShield agent tooling",
+  "main": "src/exaSearch.js",
+  "scripts": {
+    "search": "node src/search.js"
+  },
+  "engines": {
+    "node": ">=20.12"
+  },
+  "dependencies": {
+    "exa-js": "2.26.0"
+  }
+}
