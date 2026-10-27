@@ -2,3 +2,15 @@ node_modules/
 .env
 npm-debug.log*
 .DS_Store
+
+# Python / AgentShield
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+agentshield.db*
+*.db
+*.db-wal
+*.db-shm
+evaluation-results.json
