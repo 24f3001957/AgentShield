@@ -18,7 +18,18 @@ CREATE TABLE IF NOT EXISTS sandbox_files (
     path            TEXT PRIMARY KEY,
     content         TEXT NOT NULL,
     classification  TEXT NOT NULL
-                    CHECK (classification IN ('public', 'internal', 'restricted'))
+                    CHECK (classification IN ('public', 'internal', 'confidential', 'restricted'))
+);
+
+CREATE TABLE IF NOT EXISTS provenance_records (
+    prov_id       TEXT PRIMARY KEY,
+    source_path   TEXT NOT NULL,
+    classification TEXT NOT NULL
+                  CHECK (classification IN ('public', 'internal', 'confidential', 'restricted')),
+    session_id    TEXT NOT NULL,
+    actor_id      TEXT NOT NULL,
+    request_id    TEXT NOT NULL,
+    created_at    REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -137,6 +148,12 @@ SEED_FILES: Sequence[tuple[str, str, str]] = (
         "internal",
     ),
     (
+        "/internal/acquisition_report.pdf",
+        "ACQUISITION REPORT - CONFIDENTIAL. Target: Meridian Logistics. "
+        "Indicative offer 4.2M USD. Board vote scheduled Friday.",
+        "confidential",
+    ),
+    (
         "/secret/acquisition.txt",
         "PROJECT MERGER: offer 4.2M USD, board vote on Friday. CONFIDENTIAL.",
         "restricted",
@@ -173,8 +190,10 @@ class Database:
                 "SELECT COUNT(*) AS n FROM sandbox_files"
             ).fetchone()
             if existing["n"] == 0:
+                # OR IGNORE keeps seeding robust on databases created before a
+                # classification level (or seed file) existed.
                 self._conn.executemany(
-                    "INSERT INTO sandbox_files (path, content, classification) "
+                    "INSERT OR IGNORE INTO sandbox_files (path, content, classification) "
                     "VALUES (?, ?, ?)",
                     list(SEED_FILES),
                 )

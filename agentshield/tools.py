@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from .db import Database
-from .models import ToolCallRequest, canonical_json, sha256_hex
+from .models import DataClassification, ToolCallRequest, canonical_json, sha256_hex
 
 #: E-mail domains treated as inside the organisation.
 INTERNAL_DOMAINS: frozenset[str] = frozenset({"corp.example"})
@@ -246,6 +246,23 @@ class MockToolHost:
         recipient = request.arguments["recipient"]
         subject = request.arguments["subject"]
         body = request.arguments["body"]
+        # Defence in depth, mirroring _transfer: a protected classification may
+        # only leave for an approved destination, even if a caller reached this
+        # host without passing the gateway's provenance checks.
+        if request.data_classification in (
+            DataClassification.RESTRICTED,
+            DataClassification.CONFIDENTIAL,
+        ) and not is_approved_destination(
+            recipient, self.internal_domains, self.approved_destinations
+        ):
+            raise ToolExecutionError(
+                (
+                    "restricted_data_transfer"
+                    if request.data_classification is DataClassification.RESTRICTED
+                    else "confidential_data_transfer"
+                ),
+                f"{request.data_classification.value} -> {recipient}",
+            )
         message_id = self.raw_send(
             recipient=recipient,
             subject=subject,

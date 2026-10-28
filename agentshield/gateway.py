@@ -37,6 +37,11 @@ from .models import (
     canonical_json,
 )
 from .policy import PolicyEngine
+from .provenance import (
+    ProvenanceContext,
+    ProvenanceService,
+    effective_classification as derive_effective_classification,
+)
 from .tools import MockToolHost, TOOL_REGISTRY
 from .validator import ValidationResult, validate
 
@@ -88,6 +93,7 @@ class Gateway:
             approved_destinations=self.policy.config.approved_destinations,
         )
         self.approvals = ApprovalService(self.db, clock=clock, ttl_seconds=approval_ttl)
+        self.provenance = ProvenanceService(self.db, clock=clock)
         self.authorizations = AuthorizationService(
             self.db, secret=authz_secret, clock=clock, ttl_seconds=authorization_ttl
         )
@@ -129,10 +135,13 @@ class Gateway:
         validation = validate(raw)
         if not validation.ok:
             self._record_event("validation_failed", request_id, validation)
+        provenance = self._resolve_provenance(validation)
         outcome = self.policy.evaluate(
-            validation.request if validation.ok else None, validation
+            validation.request if validation.ok else None,
+            validation,
+            provenance=provenance,
         )
-        self._record_decision(request_id, validation.request, outcome)
+        self._record_decision(request_id, validation.request, outcome, provenance)
         if outcome.decision is Decision.DENY:
             self._persist(
                 request_id=request_id,
@@ -256,10 +265,13 @@ class Gateway:
         validation = validate(raw)
         if not validation.ok:
             self._record_event("validation_failed", request_id, validation)
+        provenance = self._resolve_provenance(validation)
         outcome = self.policy.evaluate(
-            validation.request if validation.ok else None, validation
+            validation.request if validation.ok else None,
+            validation,
+            provenance=provenance,
         )
-        self._record_decision(request_id, validation.request, outcome)
+        self._record_decision(request_id, validation.request, outcome, provenance)
         if outcome.decision is Decision.DENY:
             self._persist(
                 request_id=request_id,
@@ -395,6 +407,16 @@ class Gateway:
         return response
 
     # ------------------------------------------------------------------ internals
+    def _resolve_provenance(self, validation: ValidationResult) -> ProvenanceContext | None:
+        """Resolve declared provenance before policy runs; fail closed on faults."""
+        if not validation.ok or validation.request is None:
+            return None
+        request = validation.request
+        try:
+            return self.provenance.context_for(request)
+        except Exception as exc:  # noqa: BLE001 - a store fault must deny, not crash
+            return ProvenanceContext(invalid_reason=f"provenance resolution failed: {exc}")
+
     def _run(
         self,
         request: ToolCallRequest,
@@ -410,6 +432,28 @@ class Gateway:
             result: ExecutionResult = self.executor.execute(
                 request, authorization, fingerprint
             )
+            if result.outcome == "EXECUTED" and request.operation == "read":
+                # Data-flow bookkeeping is part of the trusted path: if the
+                # provenance record or its audit event cannot be written, the
+                # read result is not handed back (fail closed).
+                try:
+                    record = self.provenance.record_from_read(request, result.output)
+                    result.output["provenance"] = [record.prov_id]
+                    self.audit.append(
+                        "provenance_recorded",
+                        {
+                            "actor_id": record.actor_id,
+                            "classification": record.classification,
+                            "prov_id": record.prov_id,
+                            "request_id": record.request_id,
+                            "session_id": record.session_id,
+                            "source_path": record.source_path,
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001 - fail closed
+                    raise AuditError(
+                        f"provenance recording failed: {exc}"
+                    ) from exc
         except ExecutionDenied as exc:
             self._persist(
                 request_id=request.request_id,
@@ -540,6 +584,7 @@ class Gateway:
         request_id: str,
         request: ToolCallRequest | None,
         outcome: PolicyOutcome,
+        provenance: ProvenanceContext | None = None,
     ) -> None:
         payload: dict[str, Any] = {
             "decision": outcome.decision.value,
@@ -550,15 +595,31 @@ class Gateway:
             "rule_name": outcome.rule_name,
         }
         if request is not None:
+            effective = derive_effective_classification(
+                request.data_classification,
+                () if provenance is None else provenance.refs,
+            )
             payload.update(
                 {
                     "data_classification": request.data_classification.value,
                     "destination": request.destination,
+                    "effective_classification": effective.value,
                     "operation": request.operation,
+                    "provenance": list(request.provenance),
                     "resource": request.resource,
                     "tool_name": request.tool_name,
                 }
             )
+            if provenance is not None:
+                payload["provenance_sources"] = [
+                    record.source_path for record in provenance.refs
+                ]
+                if provenance.invalid_reason:
+                    payload["provenance_error"] = provenance.invalid_reason
+                if provenance.unaccounted_sources:
+                    payload["unaccounted_sources"] = list(
+                        provenance.unaccounted_sources
+                    )
         try:
             self.audit.append("policy_decision", payload)
         except AuditError:
@@ -589,6 +650,7 @@ class Gateway:
                 "data_classification": raw.get("data_classification"),
                 "destination": raw.get("destination"),
                 "operation": raw.get("operation", operation),
+                "provenance": raw.get("provenance"),
                 "request_id": raw.get("request_id", request_id),
                 "resource": raw.get("resource"),
                 "session_id": raw.get("session_id", session_id),

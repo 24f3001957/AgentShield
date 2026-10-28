@@ -36,7 +36,18 @@ class Decision(str, Enum):
 class DataClassification(str, Enum):
     PUBLIC = "public"
     INTERNAL = "internal"
+    CONFIDENTIAL = "confidential"
     RESTRICTED = "restricted"
+
+
+#: Severity ordering used by data-flow decisions. A more severe classification
+#: always wins when declared metadata and provenance records disagree.
+CLASSIFICATION_SEVERITY: dict[DataClassification, int] = {
+    DataClassification.PUBLIC: 0,
+    DataClassification.INTERNAL: 1,
+    DataClassification.CONFIDENTIAL: 2,
+    DataClassification.RESTRICTED: 3,
+}
 
 
 def canonical_json(payload: Any) -> str:
@@ -89,7 +100,20 @@ class ToolCallRequest(BaseModel):
     resource: str | None = None
     destination: str | None = None
     data_classification: DataClassification = DataClassification.INTERNAL
+    provenance: list[str] = Field(default_factory=list, max_length=32)
     policy_version: str = POLICY_VERSION
+
+    @field_validator("provenance")
+    @classmethod
+    def _provenance_refs_must_be_non_empty_strings(
+        cls, value: list[str]
+    ) -> list[str]:
+        cleaned: list[str] = []
+        for item in value:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError("provenance references must be non-empty strings")
+            cleaned.append(item.strip())
+        return cleaned
 
     @field_validator("arguments")
     @classmethod
@@ -127,6 +151,7 @@ def action_binding(
         "destination": request.destination,
         "operation": request.operation,
         "policy_version": policy_version,
+        "provenance": sorted(set(request.provenance)),
         "resource": request.resource,
         "session_id": request.session_id,
         "tool_name": request.tool_name,

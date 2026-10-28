@@ -16,11 +16,16 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from .models import (
+    CLASSIFICATION_SEVERITY,
     POLICY_VERSION,
     DataClassification,
     Decision,
     PolicyOutcome,
     ToolCallRequest,
+)
+from .provenance import (
+    ProvenanceContext,
+    effective_classification as derive_effective_classification,
 )
 from .tools import (
     APPROVED_DESTINATIONS,
@@ -34,8 +39,12 @@ from .validator import ValidationResult
 #: Reason codes that human approval can never override.
 HARD_DENY_REASON_CODES: frozenset[str] = frozenset(
     {
+        "confidential_data_transfer",
         "destination_not_approved",
+        "inconsistent_provenance",
+        "invalid_provenance",
         "invalid_request",
+        "missing_provenance",
         "no_matching_policy",
         "policy_version_mismatch",
         "resource_out_of_scope",
@@ -70,6 +79,7 @@ class EvalContext:
     request: ToolCallRequest
     config: PolicyConfig
     validation: ValidationResult | None = None
+    provenance: ProvenanceContext | None = None
 
     @property
     def operation(self) -> str:
@@ -90,6 +100,27 @@ class EvalContext:
     @property
     def is_restricted(self) -> bool:
         return self.classification is DataClassification.RESTRICTED
+
+    @property
+    def provenance_refs(self):
+        return () if self.provenance is None else self.provenance.refs
+
+    @property
+    def effective_classification(self) -> DataClassification:
+        """Declared classification raised by any carried provenance record."""
+        return derive_effective_classification(
+            self.classification, self.provenance_refs
+        )
+
+    @property
+    def has_invalid_provenance(self) -> bool:
+        return self.provenance is not None and not self.provenance.valid
+
+    @property
+    def has_unaccounted_confidential_sources(self) -> bool:
+        return self.provenance is not None and bool(
+            self.provenance.unaccounted_sources
+        )
 
 
 @dataclass(frozen=True)
@@ -122,6 +153,50 @@ def build_rules(config: PolicyConfig) -> list[Rule]:
             ctx.destination,
             config.internal_domains,
             config.approved_destinations,
+        )
+
+    def outbound(ctx: EvalContext) -> bool:
+        return ctx.operation in {"send", "transfer"}
+
+    def provenance_downgraded(ctx: EvalContext) -> bool:
+        """Declared classification is milder than what the refs prove."""
+        if ctx.provenance is None or not ctx.provenance.valid or not ctx.provenance_refs:
+            return False
+        ref_severity = max(
+            CLASSIFICATION_SEVERITY[DataClassification(record.classification)]
+            for record in ctx.provenance_refs
+        )
+        return (
+            CLASSIFICATION_SEVERITY[ctx.classification] < ref_severity
+        )
+
+    def outbound_without_provenance(ctx: EvalContext) -> bool:
+        """Outbound action carrying no provenance while claiming confidential,
+        or leaving confidential sources of its session unaccounted for."""
+        if not outbound(ctx) or ctx.provenance is None or not ctx.provenance.valid:
+            return False
+        if ctx.has_unaccounted_confidential_sources:
+            return True
+        return (
+            ctx.effective_classification is DataClassification.CONFIDENTIAL
+            and not ctx.provenance_refs
+        )
+
+    def confidential_flow_to_unapproved(ctx: EvalContext) -> bool:
+        return (
+            outbound(ctx)
+            and ctx.effective_classification is DataClassification.CONFIDENTIAL
+            and not is_approved_destination(
+                ctx.destination,
+                config.internal_domains,
+                config.approved_destinations,
+            )
+        )
+
+    def confidential_outbound(ctx: EvalContext) -> bool:
+        return (
+            outbound(ctx)
+            and ctx.effective_classification is DataClassification.CONFIDENTIAL
         )
 
     return [
@@ -181,7 +256,57 @@ def build_rules(config: PolicyConfig) -> list[Rule]:
             when=lambda ctx: ctx.operation == "read"
             and not ctx.path.startswith(config.readable_roots),
         ),
+        Rule(
+            name="invalid-provenance",
+            decision=Decision.DENY,
+            reason_code="invalid_provenance",
+            explanation=(
+                "A declared provenance reference could not be resolved in this "
+                "session; outbound data flow fails closed."
+            ),
+            when=lambda ctx: ctx.has_invalid_provenance,
+        ),
+        Rule(
+            name="inconsistent-provenance",
+            decision=Decision.DENY,
+            reason_code="inconsistent_provenance",
+            explanation=(
+                "The declared classification is milder than the classification "
+                "carried by the attached provenance records."
+            ),
+            when=provenance_downgraded,
+        ),
+        Rule(
+            name="outbound-without-provenance",
+            decision=Decision.DENY,
+            reason_code="missing_provenance",
+            explanation=(
+                "A protected outbound action must carry provenance covering the "
+                "confidential sources of its session."
+            ),
+            when=outbound_without_provenance,
+        ),
+        Rule(
+            name="confidential-data-to-unapproved-destination",
+            decision=Decision.DENY,
+            reason_code="confidential_data_transfer",
+            explanation=(
+                "Confidential data may not flow to a destination that is not "
+                "approved to receive it."
+            ),
+            when=confidential_flow_to_unapproved,
+        ),
         # ---- approvals ----------------------------------------------------
+        Rule(
+            name="confidential-outbound",
+            decision=Decision.APPROVAL,
+            reason_code="confidential_transfer",
+            explanation=(
+                "Confidential data bound to an approved destination requires "
+                "human approval."
+            ),
+            when=confidential_outbound,
+        ),
         Rule(
             name="external-send",
             decision=(
@@ -213,6 +338,18 @@ def build_rules(config: PolicyConfig) -> list[Rule]:
             explanation="Public sandbox files may be read freely.",
             when=lambda ctx: ctx.operation == "read"
             and ctx.path.startswith(config.public_roots),
+        ),
+        Rule(
+            name="confidential-read",
+            decision=Decision.ALLOW,
+            reason_code="confidential_read",
+            explanation=(
+                "Confidential files in readable roots may be read; their "
+                "provenance then constrains every later outbound action of the "
+                "session."
+            ),
+            when=lambda ctx: ctx.operation == "read"
+            and ctx.effective_classification is DataClassification.CONFIDENTIAL,
         ),
         Rule(
             name="internal-read",
@@ -253,6 +390,7 @@ class PolicyEngine:
         self,
         request: ToolCallRequest | None,
         validation: ValidationResult | None = None,
+        provenance: ProvenanceContext | None = None,
     ) -> PolicyOutcome:
         """Decide a request. ``request`` is ``None`` when validation failed,
         in which case the verdict is derived from the validation failure."""
@@ -275,7 +413,10 @@ class PolicyEngine:
             )
 
         context = EvalContext(
-            request=request, config=self.config, validation=validation
+            request=request,
+            config=self.config,
+            validation=validation,
+            provenance=provenance,
         )
         for rule in self.rules:
             if rule.when(context):

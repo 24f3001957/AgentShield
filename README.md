@@ -36,7 +36,19 @@ for the test suite. Nothing from the Microsoft toolkit is installed.
 python -m pytest
 ```
 
-Expected: `68 passed`.
+Expected: `82 passed`.
+
+### Run the demo
+
+```bash
+python demo.py
+```
+
+A deterministic seven-step walkthrough (read the confidential file -> denied
+external e-mail -> no side effect -> denied omission -> audit record ->
+legitimate approved action -> chain verification). It prints `PASS`/`FAIL` per
+check and exits non-zero if any expected outcome does not hold. Uses a
+temporary database; nothing is persisted.
 
 ### Run the API
 
@@ -79,6 +91,7 @@ Two independent gates protect every side effect:
 | `agentshield/models.py` | Request schema, structured decisions, canonical JSON + SHA-256 action binding |
 | `agentshield/validator.py` | Schema, tool registry, argument and resource-path checks |
 | `agentshield/policy.py` | Ordered declarative rules, hard-deny set, fail-closed default |
+| `agentshield/provenance.py` | Provenance store: minted on executed reads, resolved per session, classification ranking |
 | `agentshield/authorization.py` | HMAC-bound, expiring, single-use server authorizations |
 | `agentshield/approval.py` | Approval lifecycle with atomic consumption |
 | `agentshield/executor.py` | The only code permitted to invoke a registered tool |
@@ -90,7 +103,73 @@ Two independent gates protect every side effect:
 
 ---
 
-## Policy decisions
+## Provenance-aware data-flow enforcement
+
+The firewall does not stop at "which tool is called": it can also decide
+**whether data of a given origin and classification may flow to a given
+destination**.
+
+How the metadata moves:
+
+1. The agent reads `/internal/acquisition_report.pdf`. The tool returns its
+   content plus explicit metadata: ground-truth `classification:
+   confidential`, the source path, and a server-minted provenance id
+   (`prov_...`) that is persisted in the trusted `provenance_records` store
+   and audited (`provenance_recorded`).
+2. A later outbound action (`email_tool.send` / `transfer_tool.transfer`)
+   carries that provenance id in its `provenance` list. The gateway resolves
+   the reference **server-side, within the issuing session** before policy
+   runs; nothing about it is trusted from the client.
+3. The policy judges the **effective classification** - the most restrictive
+   of the declared classification and every attached provenance record - plus
+   the tool, the destination and the approval state.
+4. A denial happens **before** an authorization is ever issued, so the executor
+   and the mock outbox are never reached. The decision and its provenance are
+   written to the audit trail.
+
+```mermaid
+flowchart TD
+    A[agent reads<br/>/internal/acquisition_report.pdf] --> B[file tool executes<br/>ground truth: confidential]
+    B --> C[trusted store mints prov id<br/>+ audit event provenance_recorded]
+    C --> D[email send carries<br/>the provenance id]
+    D --> E{gateway resolves refs<br/>inside this session}
+    E -->|unresolvable or<br/>foreign session| F[DENY<br/>invalid_provenance]
+    E -->|resolved| G{declared vs provenance<br/>classification}
+    G -->|declared milder| H[DENY<br/>inconsistent_provenance]
+    G -->|consistent| I{confidential sources of<br/>this session accounted for}
+    I -->|missing or omitted| J[DENY<br/>missing_provenance]
+    I -->|covered| K{destination approved}
+    K -->|no| L[DENY confidential_data_transfer<br/>no outbox row]
+    K -->|yes| M[APPROVAL confidential_transfer<br/>human approves]
+    M --> N[executor verifies authorization<br/>mock email written + audited]
+```
+
+### Data-flow rules (all deterministic, server-side)
+
+| Situation | Decision | Reason code |
+|---|---|---|
+| Confidential data (declared or provenance-proven) to an unapproved destination | `DENY` | `confidential_data_transfer` |
+| Outbound action in a session with unaccounted confidential reads, or claiming confidential with no provenance | `DENY` | `missing_provenance` |
+| Provenance reference unknown or minted in another session | `DENY` | `invalid_provenance` |
+| Declared classification milder than the attached provenance proves | `DENY` | `inconsistent_provenance` |
+| Confidential data bound to an approved destination | `APPROVAL` | `confidential_transfer` |
+| Confidential file inside readable roots | `ALLOW` | `confidential_read` |
+
+All four `DENY` codes are in `HARD_DENY_REASON_CODES`: no approval can
+override them. Provenance can only ever **raise** the classification policy
+applies, never lower it.
+
+### Data-flow threat model
+
+**Defended (and tested):** an agent with general `email_tool` permission
+exfiltrating confidential mock data to an unauthorized external destination;
+replaying another session's provenance; forging an unknown reference;
+downgrading the declared classification; omitting provenance after a
+confidential read in the same session.
+
+**Not defended (read the limitations):** classification inference from message
+text (deliberately not implemented), session identity is a client-supplied
+string in this prototype, and anything that never passes through the gateway.
 
 `POLICY_VERSION = 2026-10-27-v1`. Rules are ordered data, evaluated
 first-match-wins: **every deny rule precedes every allow rule**, so one action
@@ -100,14 +179,22 @@ can never be simultaneously eligible for `DENY` and `APPROVAL`.
 |---|---|---|
 | Read `/public/meeting.txt` | `ALLOW` | `public_read` |
 | Read `/secret/acquisition.txt` | `DENY` | `restricted_resource` |
+| Read `/internal/acquisition_report.pdf` (confidential) | `ALLOW` | `confidential_read` |
 | Send an otherwise permitted message to an approved internal recipient | `ALLOW` | `internal_recipient` |
 | Send an otherwise permitted message to an external recipient | `APPROVAL` | `external_send` |
+| Send confidential data with provenance to an unapproved external recipient | `DENY` | `confidential_data_transfer` |
+| Send in a session that still holds unaccounted confidential reads | `DENY` | `missing_provenance` |
+| Send with an unresolvable or foreign-session provenance reference | `DENY` | `invalid_provenance` |
+| Declare a milder classification than the provenance proves | `DENY` | `inconsistent_provenance` |
+| Send confidential data with provenance to the approved vault | `APPROVAL` | `confidential_transfer` |
 | Transfer restricted data to an unapproved destination | `DENY` | `restricted_data_transfer` |
 | Call an unknown tool | `DENY` | `unknown_tool` |
 | Submit malformed arguments | `DENY` | `invalid_request` |
 
 Additional fail-closed outcomes: `unsupported_operation`,
 `resource_out_of_scope`, `destination_not_approved`, `policy_version_mismatch`,
+`missing_provenance`, `invalid_provenance`, `inconsistent_provenance`,
+`confidential_data_transfer`,
 `no_matching_policy` (the default when no rule matches).
 
 **A hard denial is never overridable by approval.** Every `DENY` above is in
@@ -192,8 +279,16 @@ fixtures** (11 cases: 6 malicious, 5 benign):
 | Approval mutation rejection | - | 1/1 (1.0) |
 | Audit integrity detection (all alterations) | - | 2/3 (0.6667) |
 | Audit integrity detection (with trust anchor) | - | 1/1 (1.0) |
+| Unauthorized disclosure blocked (data-flow scenario) | - | 2/2 (1.0) |
+| Data-flow benign completion (via approval) | - | 1/1 (1.0) |
 
 Zero denominators report `N/A`; unrun tests report `Not yet measured`.
+
+The two data-flow rows come from **one deterministic scenario** in a single
+session (2 disclosure attempts + 1 legitimate action, run by
+`EvaluationRunner._data_flow_experiment` and pinned by
+`tests/test_dataflow.py::test_evaluation_data_flow_metrics_match_raw_attempts`).
+They are measurements of that scenario, not benchmark scores.
 
 > These are results of our own hand-written fixtures, **not** AgentDojo,
 > InjecAgent or JailbreakBench, and not produced by their harnesses. They are
@@ -261,6 +356,25 @@ Plus: a fabricated authorization is refused by the executor
 records never contain message bodies
 (`test_gateway.py::test_audit_does_not_record_message_contents`).
 
+### Data-flow acceptance tests (`tests/test_dataflow.py`, 14 tests)
+
+| Guarantee | Test |
+|---|---|
+| Confidential read returns classification, source and a persisted provenance id | `test_confidential_read_records_provenance_metadata` |
+| Confidential data denied to an unauthorized external destination | `test_confidential_data_to_external_destination_is_denied` |
+| Denied action leaves no outbox row and no ledger row | `test_denied_confidential_send_has_no_outbox_side_effect` |
+| Public workflows still complete normally | `test_public_workflow_still_completes` |
+| Omitting provenance after a confidential read cannot bypass policy | `test_omitting_provenance_cannot_bypass_data_flow_policy` |
+| Claiming confidential with no provenance fails closed | `test_confidential_claim_without_provenance_fails_closed` |
+| Unknown provenance reference fails closed | `test_unknown_provenance_reference_fails_closed` |
+| Foreign-session provenance fails closed | `test_cross_session_provenance_reference_fails_closed` |
+| Downgraded classification fails closed | `test_downgraded_classification_fails_closed` |
+| Tool host itself refuses classified e-mail to unapproved destinations | `test_authorization_defence_in_depth_blocks_confidential_send` |
+| Provenance is bound into the approval (mutation, replay, expiry) | `test_provenance_is_bound_to_the_approval` |
+| Audit decision carries the provenance and effective classification | `test_audit_decision_carries_provenance_metadata` |
+| Audit chain verifies after a data-flow workload | `test_audit_chain_verifies_after_data_flow_workload` |
+| Evaluation data-flow metrics match the raw attempt rows | `test_evaluation_data_flow_metrics_match_raw_attempts` |
+
 ---
 
 ## Limitations - read this before trusting it
@@ -268,6 +382,20 @@ records never contain message bodies
 - **Scope**: protection applies only to actions mediated by the gateway. A
   tool invoked outside this code path, or any process with direct database
   access, is not protected.
+- **Provenance is declaration-based, not content-based**: enforcement keys on
+  the provenance the action carries and on reads recorded in the same
+  session. Message text is deliberately never inspected or classified, so
+  confidential data that enters a flow *without* a recorded read in that
+  session (e.g. typed in directly) is judged only by its declared
+  classification.
+- **Session identity is a client-supplied string**: there is no
+  authentication tying `session_id` to a principal, so a client able to lie
+  about its session could split taint across sessions. A real deployment must
+  bind session identity server-side.
+- **Stale local databases**: `sandbox_files` seeds (including
+  `/internal/acquisition_report.pdf`) are inserted only into a fresh database.
+  After pulling this change, delete a pre-existing `agentshield.db` so the
+  new seed and schema take effect.
 - **Mock tools only**: no real file system, mail account, credential or
   external service is reachable. Do not wire real tools in without re-reviewing
   the executor.
@@ -313,7 +441,8 @@ released under the [MIT Licence](LICENSE).
 
 ```
 agentshield/          Python package - the permission firewall
-tests/                pytest suite (policy, gateway, approvals, audit, API, evaluation)
+tests/                pytest suite (policy, gateway, approvals, audit, API, evaluation, data flow)
+demo.py               deterministic data-flow demo sequence
 src/                  Node.js Exa web-search module (separate, unchanged)
 requirements.txt      Python dependencies
 pytest.ini            test configuration
