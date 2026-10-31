@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -26,11 +27,17 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
-from .approval import ApprovalError
+from .approval import PENDING_STATE, ApprovalError
 from .audit import AuditError
 from .evaluation import EvaluationRunner
 from .gateway import Gateway
 from .models import CANONICALIZATION_VERSION, POLICY_VERSION
+from .simulation import (
+    get_simulation,
+    latest_simulation,
+    list_simulations,
+    run_secret_read,
+)
 
 DEFAULT_DB_PATH = "agentshield.db"
 
@@ -244,6 +251,103 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 "Content-Disposition": f'attachment; filename="{row["run_id"]}.json"'
             },
         )
+
+    # -- classifier (advisory) ----------------------------------------------
+    @app.get("/classifier")
+    def classifier() -> dict[str, Any]:
+        """Model card plus held-out metrics for the advisory classifier."""
+        return {
+            **gateway.classifier.describe(),
+            "metrics": gateway.classifier.metrics(),
+        }
+
+    # -- simulation + metrics -----------------------------------------------
+    @app.post("/simulations/secret-read")
+    def simulate_secret_read() -> dict[str, Any]:
+        """Run the exfiltration scenario through the real gateway."""
+        return run_secret_read(gateway)
+
+    @app.get("/simulations")
+    def simulations(limit: int = Query(default=20, ge=1, le=100)) -> dict[str, Any]:
+        return {"simulations": list_simulations(gateway.db, limit=limit)}
+
+    @app.get("/simulations/latest")
+    def simulations_latest() -> Any:
+        record = latest_simulation(gateway.db)
+        if record is None:
+            return _error("not_found", "no simulation has been run", 404)
+        return record
+
+    @app.get("/simulations/{run_id}")
+    def simulation_detail(run_id: str) -> Any:
+        record = get_simulation(gateway.db, run_id)
+        if record is None:
+            return _error("not_found", f"unknown run_id {run_id}", 404)
+        return record
+
+    @app.get("/metrics")
+    def metrics() -> dict[str, Any]:
+        """Backend-derived security metrics for the dashboard."""
+        decision_rows = gateway.db.query(
+            "SELECT decision, COUNT(*) AS n FROM tool_calls "
+            "WHERE decision IS NOT NULL GROUP BY decision"
+        )
+        decisions = {str(row["decision"]): int(row["n"]) for row in decision_rows}
+        unauthorized = gateway.db.query_one(
+            "SELECT COUNT(*) AS n FROM execution_ledger l "
+            "JOIN tool_calls c ON c.request_id = l.request_id "
+            "WHERE c.decision = 'DENY'"
+        )
+        runs = list_simulations(gateway.db, limit=1)
+        verification = gateway.audit.verify()
+        summary = gateway.classifier.metrics()
+        return {
+            "generated_at": time.time(),
+            "policy_version": POLICY_VERSION,
+            "tool_calls": gateway.db.count("tool_calls"),
+            "decisions": {
+                "ALLOW": decisions.get("ALLOW", 0),
+                "DENY": decisions.get("DENY", 0),
+                "APPROVAL": decisions.get("APPROVAL", 0),
+            },
+            "executions": gateway.db.count("execution_ledger"),
+            "unauthorized_executions": 0 if unauthorized is None else int(unauthorized["n"]),
+            "pending_approvals": gateway.db.count(
+                "approvals", "state = ?", (PENDING_STATE,)
+            ),
+            "approvals": gateway.db.count("approvals"),
+            "audit": {
+                "valid": verification.valid,
+                "event_count": verification.event_count,
+                "head": verification.head,
+                "failures": verification.failures,
+            },
+            "simulations": {
+                "count": gateway.db.count("simulation_runs"),
+                "latest": runs[0] if runs else None,
+            },
+            "classifier": {
+                "model_version": summary["model_version"],
+                "dataset_version": summary["dataset_version"],
+                "dataset_size": summary["dataset_size"],
+                "test_size": summary["test_size"],
+                "accuracy": summary["accuracy"],
+                "macro_f1": summary["macro_f1"],
+                "abstention_rate": summary["abstention_rate"],
+                "false_positive": summary["false_positive"],
+                "false_negative": summary["false_negative"],
+                "authority": "advisory only",
+            },
+            "sources": {
+                "decisions": "tool_calls.decision",
+                "executions": "execution_ledger",
+                "unauthorized_executions": (
+                    "execution_ledger joined to tool_calls where decision = DENY"
+                ),
+                "audit": "audit_events + hash-chain verifier",
+                "classifier": "held-out split of bundled fixtures",
+            },
+        }
 
     # -- reviewer UI (optional) ---------------------------------------------
     # When the frontend has been built (`npm run build` in ./frontend), serve it

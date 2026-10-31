@@ -1,10 +1,14 @@
 import type {
   Approval,
   AuditEvent,
+  ClassifierDoc,
   EvaluationResults,
   GatewayResponse,
   Health,
+  Metrics,
   PolicyDoc,
+  SimulationResult,
+  SimulationSummary,
   ToolCallDetail,
   ToolCallSummary,
   VerifyResult,
@@ -113,6 +117,20 @@ export const api = {
   },
 
   runEvaluation: () => post<EvaluationResults>("/evaluation/run"),
+
+  classifier: () => request<ClassifierDoc>("/classifier"),
+
+  metrics: () => request<Metrics>("/metrics"),
+
+  runSecretRead: () => post<SimulationResult>("/simulations/secret-read"),
+
+  simulations: () =>
+    request<{ simulations: SimulationSummary[] }>("/simulations?limit=20"),
+
+  latestSimulation: () => request<SimulationResult>("/simulations/latest"),
+
+  simulation: (runId: string) =>
+    request<SimulationResult>(`/simulations/${encodeURIComponent(runId)}`),
 
   evaluationResults: () => request<EvaluationResults>("/evaluation/results"),
 

@@ -8,6 +8,7 @@ import {
   Panel,
   RefreshNote,
 } from "../components/ui";
+import { ClassifierPanel } from "../components/ClassifierPanel";
 import { ApiError, api } from "../lib/api";
 import { formatRate, formatTimestamp, messageOf, pluralize } from "../lib/format";
 import type { EvaluationResults, Metric } from "../lib/types";
@@ -101,6 +102,8 @@ export default function Evaluation() {
       />
 
       {error ? <ErrorBanner error={error} /> : null}
+
+      <ClassifierPanel />
 
       {loading ? (
         <Loading label="Loading evaluation results" />

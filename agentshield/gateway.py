@@ -25,6 +25,7 @@ from typing import Any
 
 from .approval import ApprovalError, ApprovalRecord, ApprovalService
 from .audit import AuditError, AuditLog
+from .classifier import PolicyClassifier, default_classifier
 from .authorization import AuthorizationService
 from .db import Database
 from .executor import ControlledExecutor, ExecutionDenied, ExecutionResult
@@ -83,6 +84,7 @@ class Gateway:
         approval_ttl: float = 300.0,
         authorization_ttl: float = 300.0,
         authz_secret: bytes | None = None,
+        classifier: PolicyClassifier | None = None,
     ) -> None:
         self.db = db if isinstance(db, Database) else Database(db)
         self.clock = clock
@@ -98,6 +100,8 @@ class Gateway:
             self.db, secret=authz_secret, clock=clock, ttl_seconds=authorization_ttl
         )
         self.audit = AuditLog(self.db, clock=clock)
+        # Advisory only: consulted for the audit record, never for a verdict.
+        self.classifier = classifier or default_classifier()
         self.executor = ControlledExecutor(
             self.db, self.tools, self.authorizations, self.audit, clock=clock
         )
@@ -610,6 +614,21 @@ class Gateway:
                     "tool_name": request.tool_name,
                 }
             )
+            # Advisory signal, recorded next to (never instead of) the verdict.
+            advisory = self.classifier.advisory(
+                {
+                    "tool_name": request.tool_name,
+                    "operation": request.operation,
+                    "resource": request.resource,
+                    "destination": request.destination,
+                    "data_classification": request.data_classification.value,
+                    "provenance": list(request.provenance),
+                    "arguments": request.arguments,
+                }
+            )
+            if advisory is not None:
+                payload["classifier"] = advisory
+                payload["final_decision"] = outcome.decision.value
             if provenance is not None:
                 payload["provenance_sources"] = [
                     record.source_path for record in provenance.refs

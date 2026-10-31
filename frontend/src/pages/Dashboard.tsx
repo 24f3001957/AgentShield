@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Badge,
@@ -6,6 +6,7 @@ import {
   EmptyState,
   ErrorBanner,
   Hash,
+  KeyValue,
   Loading,
   PageHeader,
   Panel,
@@ -14,8 +15,9 @@ import {
   StateBadge,
 } from "../components/ui";
 import { api } from "../lib/api";
+import { useAppState } from "../lib/appState";
 import { metaFor } from "../lib/events";
-import { formatClock, formatTimestamp, relativeTime, pluralize } from "../lib/format";
+import { formatClock, formatTimestamp, messageOf, relativeTime, pluralize } from "../lib/format";
 import { useNow, usePolled } from "../lib/hooks";
 import { groupChains } from "../lib/trace";
 import type { AuditEvent } from "../lib/types";
@@ -32,6 +34,44 @@ export default function Dashboard() {
   const events = usePolled(() => api.auditEvents(300), 5000);
   const approvals = usePolled(() => api.approvals(), 5000);
   const verify = usePolled(() => api.verify({}), 15000);
+  const metrics = usePolled(() => api.metrics(), 5000);
+  const { latestSimulation, setLatestSimulation, dataVersion, ask } = useAppState();
+  const [runBusy, setRunBusy] = useState(false);
+  const [runError, setRunError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!dataVersion) return;
+    void events.refresh();
+    void metrics.refresh();
+    void approvals.refresh();
+    void verify.refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataVersion]);
+
+  useEffect(() => {
+    if (latestSimulation) return;
+    api
+      .latestSimulation()
+      .then((run) => setLatestSimulation(run))
+      .catch(() => undefined);
+  }, [latestSimulation, setLatestSimulation]);
+
+  async function runAttack() {
+    if (runBusy) return;
+    setRunBusy(true);
+    setRunError(null);
+    try {
+      const run = await api.runSecretRead();
+      setLatestSimulation(run);
+      void events.refresh();
+      void metrics.refresh();
+      void verify.refresh();
+    } catch (caught) {
+      setRunError(messageOf(caught));
+    } finally {
+      setRunBusy(false);
+    }
+  }
 
   const auditEvents: AuditEvent[] = events.data?.events ?? [];
   const decisions = useMemo(
@@ -133,6 +173,179 @@ export default function Dashboard() {
           }
           onClick={() => navigate("/integrity")}
         />
+      </div>
+
+      <div className="stat-grid stat-grid--four">
+        <StatCard
+          label="Unauthorized executions"
+          value={metrics.data ? metrics.data.unauthorized_executions : "—"}
+          tone="teal"
+          hint="execution rows whose policy decision was DENY — should always be 0"
+        />
+        <StatCard
+          label="Simulation runs"
+          value={metrics.data ? metrics.data.simulations.count : "—"}
+          tone="blue"
+          hint={
+            metrics.data?.simulations.latest
+              ? `latest: ${metrics.data.simulations.latest.outcome} · ${metrics.data.simulations.latest.reason_code ?? "—"}`
+              : "no scenario executed yet"
+          }
+          onClick={() => navigate("/graph")}
+        />
+        <StatCard
+          label="Advisory macro F1"
+          value={
+            metrics.data?.classifier.macro_f1 != null
+              ? metrics.data.classifier.macro_f1.toFixed(2)
+              : "N/A"
+          }
+          tone="purple"
+          hint={
+            metrics.data
+              ? `held-out ${metrics.data.classifier.test_size} fixtures · ${(
+                  metrics.data.classifier.abstention_rate * 100
+                ).toFixed(0)}% abstained`
+              : "model card loading"
+          }
+          onClick={() => navigate("/evaluation")}
+        />
+        <StatCard
+          label="Tool calls recorded"
+          value={metrics.data ? metrics.data.tool_calls : "—"}
+          tone="muted"
+          hint={metrics.data ? `${metrics.data.executions} reached the executor` : "backend metrics"}
+          onClick={() => navigate("/logs")}
+        />
+      </div>
+
+      <div className="layout-two">
+        <Panel
+          title="Secret-read attack"
+          subtitle="Reads a confidential file, then attempts external e-mail with its provenance"
+          actions={
+            <button
+              type="button"
+              className="btn btn--primary btn--sm"
+              onClick={() => void runAttack()}
+              disabled={runBusy}
+            >
+              {runBusy ? "Running…" : "Run attack"}
+            </button>
+          }
+        >
+          {runError ? <ErrorBanner error={runError} /> : null}
+          {!latestSimulation ? (
+            <EmptyState
+              title="No simulation yet"
+              message="The assistant and this button both call POST /simulations/secret-read, which runs the scenario through the real gateway."
+              action={
+                <div className="button-row">
+                  <button type="button" className="btn btn--primary btn--sm" onClick={() => void runAttack()} disabled={runBusy}>
+                    Run secret-read attack
+                  </button>
+                  <button type="button" className="btn btn--ghost btn--sm" onClick={() => ask("Run the secret-read attack")}>
+                    Ask the assistant
+                  </button>
+                </div>
+              }
+            />
+          ) : (
+            <div className="stack">
+              <div className="response-head">
+                <DecisionBadge decision={latestSimulation.result.decision} />
+                <Badge tone={latestSimulation.result.side_effect ? "coral" : "teal"}>
+                  {latestSimulation.result.side_effect ? "side effect" : "no side effect"}
+                </Badge>
+                <span className="mono muted">
+                  {String(latestSimulation.result.reason_code ?? "—")}
+                </span>
+              </div>
+              <p className="detail-explanation">
+                {latestSimulation.result.explanation ?? "No explanation recorded."}
+              </p>
+              <div className="detail-grid">
+                <KeyValue label="Blocked at" mono>
+                  {latestSimulation.result.blocked_at ?? "no block"}
+                </KeyValue>
+                <KeyValue label="Executor" mono>
+                  {latestSimulation.result.executed ? "ran the action" : "never reached"}
+                </KeyValue>
+                <KeyValue label="Mock outbox" mono>
+                  {latestSimulation.result.outbox_before} → {latestSimulation.result.outbox_after}
+                </KeyValue>
+                <KeyValue label="Run" mono>
+                  {latestSimulation.run_id}
+                </KeyValue>
+              </div>
+              <div className="button-row">
+                <button
+                  type="button"
+                  className="btn btn--primary btn--sm"
+                  onClick={() => navigate(`/graph?run=${encodeURIComponent(latestSimulation.run_id)}`)}
+                >
+                  Open animated path
+                </button>
+                <button
+                  type="button"
+                  className="btn btn--ghost btn--sm"
+                  onClick={() =>
+                    navigate(
+                      `/logs?request=${encodeURIComponent(latestSimulation.result.request_id)}`,
+                    )
+                  }
+                >
+                  Inspect audit events
+                </button>
+              </div>
+            </div>
+          )}
+        </Panel>
+
+        <Panel
+          title="Advisory classifier"
+          subtitle="TF-IDF + logistic regression · cannot authorize or block"
+          actions={
+            <button type="button" className="btn btn--ghost btn--sm" onClick={() => navigate("/evaluation")}>
+              Model card
+            </button>
+          }
+        >
+          {!metrics.data ? (
+            <Loading label="Loading model card" />
+          ) : (
+            <div className="stack">
+              <div className="response-head">
+                <Badge tone="purple">{metrics.data.classifier.model_version}</Badge>
+                <span className="muted mono">{metrics.data.classifier.dataset_version}</span>
+              </div>
+              <div className="detail-grid">
+                <KeyValue label="Decision accuracy" mono>
+                  {(metrics.data.classifier.accuracy * 100).toFixed(1)}%
+                </KeyValue>
+                <KeyValue label="Macro F1" mono>
+                  {metrics.data.classifier.macro_f1?.toFixed(3) ?? "N/A"}
+                </KeyValue>
+                <KeyValue label="Abstention rate" mono>
+                  {(metrics.data.classifier.abstention_rate * 100).toFixed(1)}%
+                </KeyValue>
+                <KeyValue label="Fixtures" mono>
+                  {metrics.data.classifier.dataset_size} total · {metrics.data.classifier.test_size} held out
+                </KeyValue>
+                <KeyValue label="False positives" mono>
+                  {metrics.data.classifier.false_positive}
+                </KeyValue>
+                <KeyValue label="False negatives" mono>
+                  {metrics.data.classifier.false_negative}
+                </KeyValue>
+              </div>
+              <p className="fine-print">
+                Custom fixture set authored from the policy scenarios — not an external benchmark.
+                Abstentions fall back to the deterministic policy, which remains authoritative.
+              </p>
+            </div>
+          )}
+        </Panel>
       </div>
 
       <div className="layout-two">

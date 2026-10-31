@@ -179,6 +179,146 @@ export type EvalCase = {
   completed: boolean;
 };
 
+export type ClassifierPrediction = {
+  model_version: string;
+  policy_version: string;
+  prediction: "allow" | "approval" | "ambiguous" | "deny";
+  decision_hint: string;
+  confidence: number;
+  margin: number;
+  abstained: boolean;
+  reason: string | null;
+  probabilities: Record<string, number>;
+  threshold: number;
+  margin_threshold: number;
+  authority: string;
+};
+
+export type ClassifierMetrics = {
+  dataset_version: string;
+  dataset_source: string;
+  dataset_size: number;
+  train_size: number;
+  test_size: number;
+  split: string;
+  evaluation_scope: string;
+  labels: string[];
+  accuracy: number;
+  accuracy_definition: string;
+  exact_match_accuracy: number;
+  macro_f1: number | null;
+  macro_f1_note: string;
+  per_class: Record<
+    string,
+    {
+      support: number;
+      tp: number;
+      fp: number;
+      fn: number;
+      precision: number | null;
+      recall: number | null;
+      f1: number | null;
+    }
+  >;
+  confusion_matrix: Record<string, Record<string, number>>;
+  abstentions: number;
+  abstention_rate: number;
+  false_positive: number;
+  false_negative: number;
+  false_positive_definition: string;
+  false_negative_definition: string;
+  thresholds: { confidence: number; margin: number; oov_ratio: number };
+  feature_count: number;
+  model_version: string;
+  policy_version: string;
+};
+
+export type ClassifierDoc = {
+  model_version: string;
+  dataset_version: string;
+  dataset_source: string;
+  labels: string[];
+  thresholds: { confidence: number; margin: number; oov_ratio: number };
+  authority: string;
+  metrics: ClassifierMetrics;
+};
+
+export type SimulationStep = {
+  step: number;
+  name: string;
+  request: Record<string, unknown> & {
+    tool_name: string;
+    operation: string;
+    arguments: Record<string, unknown>;
+    session_id: string;
+  };
+  response: GatewayResponse;
+  audit_events: AuditEvent[];
+  observed: Record<string, unknown>;
+};
+
+export type SimulationResult = {
+  run_id: string;
+  scenario: string;
+  scenario_label: string;
+  scenario_description: string;
+  created_at: number;
+  policy_version: string;
+  actor_id: string;
+  session_id: string;
+  steps: SimulationStep[];
+  result: {
+    request_id: string;
+    decision: Decision | null;
+    reason_code: string | null;
+    status: string | null;
+    explanation: string | null;
+    executed: boolean;
+    side_effect: boolean;
+    blocked_at: string | null;
+    approval_id: string | null;
+    outbox_before: number;
+    outbox_after: number;
+    execution_rows: number;
+  };
+  audit: { event_count: number; head: string };
+  notes: string[];
+};
+
+export type SimulationSummary = {
+  run_id: string;
+  scenario: string;
+  created_at: number;
+  outcome: string;
+  reason_code: string | null;
+};
+
+export type Metrics = {
+  generated_at: number;
+  policy_version: string;
+  tool_calls: number;
+  decisions: { ALLOW: number; DENY: number; APPROVAL: number };
+  executions: number;
+  unauthorized_executions: number;
+  pending_approvals: number;
+  approvals: number;
+  audit: { valid: boolean; event_count: number; head: string; failures: string[] };
+  simulations: { count: number; latest: SimulationSummary | null };
+  classifier: {
+    model_version: string;
+    dataset_version: string;
+    dataset_size: number;
+    test_size: number;
+    accuracy: number;
+    macro_f1: number | null;
+    abstention_rate: number;
+    false_positive: number;
+    false_negative: number;
+    authority: string;
+  };
+  sources: Record<string, string>;
+};
+
 export type EvaluationResults = {
   run_id: string;
   created_at: number;

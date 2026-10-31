@@ -127,6 +127,15 @@ CREATE TABLE IF NOT EXISTS evaluation_runs (
     created_at  REAL NOT NULL,
     results_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS simulation_runs (
+    run_id       TEXT PRIMARY KEY,
+    scenario     TEXT NOT NULL,
+    created_at   REAL NOT NULL,
+    outcome      TEXT NOT NULL,
+    reason_code  TEXT,
+    results_json TEXT NOT NULL
+);
 """
 
 #: Deterministic mock sandbox contents. ``restricted`` rows are the data the

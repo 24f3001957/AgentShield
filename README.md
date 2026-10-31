@@ -29,7 +29,9 @@ for the test suite. Nothing from the Microsoft toolkit is installed.
 python -m pytest
 ```
 
-Expected: `82 passed`.
+Expected: `98 passed`. The suite covers the firewall, approvals, audit chain,
+data flow, the evaluation harness, the advisory classifier (`tests/test_classifier.py`)
+and the secret-read simulation through the real API (`tests/test_simulations.py`).
 
 ### Run the demo
 
@@ -84,6 +86,26 @@ Integrity, Evaluation and an Agent Console for submitting mock calls. The
 console adds the pages and a read-only `GET /policy` view; it introduces **no**
 second execution path, and the policy is deliberately not editable from the UI
 because the backend has no draft/publish endpoint.
+
+The Execution Graph has two views. **Animated pipeline** places the real
+components (agent → gateway → validator → policy → approval/authorization →
+controlled executor → audit writer → verifier) and animates particles along the
+recorded events of a simulation; a denial stops at the policy engine and never
+lights the executor edge. **Forensic trace** is the earlier audit-event graph,
+still driven only by recorded events.
+
+The floating assistant (**Shield Assistant**) maps deterministic phrases to an
+allowlisted set of API calls: run the secret-read attack, list/approve/reject
+pending approvals (with an explicit confirmation step), verify the audit chain,
+compare firewall OFF/ON, and show the latest run. It never generates code or
+model-directed requests, and it cannot authorize anything: approval records a
+decision only, and execution remains a separate gateway step.
+
+The backdrop is `frontend/src/components/GradientASCII.tsx`, a local canvas
+implementation of the supplied ASCII-gradient component API. It is decorative
+(`aria-hidden`, `pointer-events: none`), capped at 24 fps and DPR 2, paused when
+the tab is hidden, and drawn once with no animation when the user prefers
+reduced motion.
 
 ---
 
@@ -322,6 +344,62 @@ They are measurements of that scenario, not benchmark scores.
 
 ---
 
+## Policy-aware advisory classifier
+
+`agentshield/classifier.py` is a small, dependency-free classifier: TF-IDF over
+policy-shaped features plus a multinomial logistic-regression head, trained
+in-process from `agentshield/data/classifier_fixtures.json` (120 labelled rows
+authored from this repository's policy scenarios, not an external benchmark).
+
+Features mirror what the deterministic policy looks at - tool, operation,
+resource root, destination class, declared classification, provenance presence,
+plus interactions such as `class->destination` - so message bodies never enter
+the model. Labels are `allow`, `approval`, `deny` and `ambiguous`.
+
+**It is advisory only.** The gateway still runs validation, policy, approval and
+authorization unchanged, then records the prediction next to the authoritative
+verdict (`policy_decision.classifier` plus `final_decision` in the audit
+payload). A confident "allow" cannot make a denied call execute; a confident
+"deny" cannot block an allowed one. The model abstains below 0.50 confidence,
+when the top-two margin is under 0.05, when the unknown-feature ratio is at
+least 0.5, or when the tool is not in the registry - and an abstention defers to
+the policy, which is the safe fallback.
+
+Held-out split of the bundled fixtures (every third sample per label, 39 test
+rows; deterministic, `GET /classifier`):
+
+| Metric | Value |
+|---|---|
+| Decision accuracy (abstention correct only for `ambiguous` rows) | 0.872 |
+| Exact-match accuracy | 0.769 |
+| Macro F1 (4 labels; an abstention is a miss for the true class) | 0.910 |
+| Abstention rate | 0.180 |
+| False positive / false negative (binary unsafe view) | 0 / 0 |
+
+These are **custom-fixture numbers**, not benchmark results, and a 39-row test
+split is small. The UI labels them the same way.
+
+---
+
+## Attack simulation and the assistant
+
+`POST /simulations/secret-read` runs two ordinary submissions through
+`Gateway.submit`: read `/internal/acquisition_report.pdf` (allowed, mints
+provenance), then e-mail it to `leak@external.example` with that provenance
+(denied `confidential_data_transfer`). Nothing is scripted to look blocked:
+the response contains the gateway's own verdict plus observed mock-store counts,
+and the UI renders whatever came back - including a side effect, if one ever
+occurred. Runs are persisted in `simulation_runs` and exposed via
+`GET /simulations` and `GET /simulations/latest`.
+
+`GET /metrics` derives dashboard numbers from storage (`tool_calls.decision`,
+`execution_ledger`, `simulations`, and the audit verifier), including
+`unauthorized_executions` - executions whose recorded policy decision was
+`DENY`. That value is expected to be `0`, and the dashboard says so rather than
+hiding it.
+
+---
+
 ## API
 
 | Method & path | Purpose |
@@ -337,6 +415,10 @@ They are measurements of that scenario, not benchmark scores.
 | `GET /audit/verify` | Verify the chain, optionally against a trust anchor |
 | `POST /evaluation/run` | Run both conditions and score them |
 | `GET /evaluation/results`, `GET /evaluation/export` | Retrieve / download results |
+| `GET /classifier` | Model card, thresholds, held-out metrics and confusion matrix |
+| `POST /simulations/secret-read` | Run the exfiltration scenario through the gateway |
+| `GET /simulations`, `GET /simulations/latest`, `GET /simulations/{run_id}` | Stored simulation runs |
+| `GET /metrics` | Backend-derived dashboard counters, integrity status, classifier summary |
 
 There is **no endpoint that executes a tool directly** and none that lets a
 client mint an authorization.
@@ -434,7 +516,16 @@ records never contain message bodies
   `AGENTSHIELD_AUTHZ_SECRET` is set, so authorizations do not survive restarts.
 - **The audit chain** is tamper-evident, not tamper-proof (see above), and a
   local attacker who owns the database can rewrite it.
-- **Fixtures are illustrative**, not benchmark results.
+- **Fixtures are illustrative**, not benchmark results. The classifier's
+  metrics come from a held-out split of 39 authored rows and describe only
+  this small fixture set.
+- **The classifier is advisory**: it has no authority anywhere in the request
+  path. It also deliberately ignores message text, so it cannot detect intent
+  that is not visible in tool, resource, destination, classification and
+  provenance.
+- **The chat assistant is deterministic**: it pattern-matches a fixed list of
+  phrases to allowlisted API calls. It is not an LLM, cannot improvise an
+  action, and does not parse free-form parameters beyond approval ids.
 
 ---
 
@@ -468,8 +559,31 @@ released under the [MIT Licence](LICENSE).
 
 ```
 agentshield/          Python package - the permission firewall
-tests/                pytest suite (policy, gateway, approvals, audit, API, evaluation, data flow)
+  classifier.py       advisory TF-IDF + logistic-regression model and metrics
+  simulation.py       secret-read scenario executed through the gateway
+  data/               labelled classifier fixtures (+ provenance note)
+frontend/             React + TypeScript reviewer console (Vite, React Flow)
+tests/                pytest suite (policy, gateway, approvals, audit, API,
+                      evaluation, data flow, classifier, simulations)
 demo.py               deterministic data-flow demo sequence
-requirements.txt      Python dependencies
+requirements.txt      Python dependencies (runtime + test only)
 pytest.ini            test configuration
 ```
+
+### Demo script (2 minutes)
+
+1. Open the dashboard: the top row shows backend-derived counters; the second
+   row shows unauthorized executions (0), simulation runs, classifier macro F1
+   and recorded tool calls.
+2. Click **Run attack**, or ask the assistant “Run the secret-read attack”.
+   The card shows `DENY / confidential_data_transfer`, `blocked at
+   policy_engine`, outbox `0 → 0`, execution rows `0`.
+3. Click **Open animated path**: particles travel agent → gateway → validator →
+   policy and stop; the policy node pulses red, the executor edge stays dark.
+   Switch to **Forensic trace** to inspect the underlying audit events and
+   hashes.
+4. Open the assistant again: “Show pending approvals”, then “Approve this
+   request” (it asks for confirmation). Approval records a decision only.
+5. “Verify the audit log” returns the chain status; “Compare firewall on and
+   off” runs the paired fixture evaluation and reports both attack-success
+   rates with numerators and denominators.

@@ -12,6 +12,9 @@ import {
 } from "@xyflow/react";
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
+import { PipelineGraph } from "../components/PipelineGraph";
+import { useAppState } from "../lib/appState";
+import type { SimulationResult } from "../lib/types";
 import {
   Badge,
   CopyButton,
@@ -243,8 +246,8 @@ function makeEdge(
   };
 }
 
-export default function ExecutionGraph() {
-  const [searchParams] = useSearchParams();
+function TraceView() {
+  const [searchParams, setSearchParams] = useSearchParams();
   const initialRequest = searchParams.get("request");
   const initialSession = searchParams.get("session");
   const initialFocus = searchParams.get("focus");
@@ -354,6 +357,17 @@ export default function ExecutionGraph() {
         subtitle="Nodes are recorded audit events; edges are their recorded sequence. The graph never infers execution from agent intent."
         actions={
           <div className="header-meta">
+            <button
+              type="button"
+              className="btn btn--ghost btn--sm"
+              onClick={() => {
+                const next = new URLSearchParams(searchParams);
+                next.set("view", "pipeline");
+                setSearchParams(next, { replace: true });
+              }}
+            >
+              Animated pipeline
+            </button>
             <RefreshNote updatedAt={events.updatedAt} />
             <button
               type="button"
@@ -595,6 +609,94 @@ export default function ExecutionGraph() {
           </li>
         </ul>
       </Panel>
+    </>
+  );
+}
+
+export default function ExecutionGraph() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const mode = searchParams.get("view") === "trace" ? "trace" : "pipeline";
+  const runParam = searchParams.get("run");
+  const { latestSimulation, setLatestSimulation } = useAppState();
+  const [run, setRun] = useState<SimulationResult | null>(latestSimulation);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [replay, setReplay] = useState(0);
+
+  useEffect(() => {
+    if (mode !== "pipeline") return;
+    let alive = true;
+    const load = async () => {
+      try {
+        const next = runParam
+          ? await api.simulation(runParam)
+          : latestSimulation ?? (await api.latestSimulation().catch(() => null));
+        if (alive && next) {
+          setRun(next);
+          setLatestSimulation(next);
+          setReplay((value) => value + 1);
+          setError(null);
+        }
+      } catch (caught) {
+        if (alive) setError(messageOf(caught));
+      }
+    };
+    void load();
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, runParam]);
+
+  async function runAttack() {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await api.runSecretRead();
+      setRun(result);
+      setLatestSimulation(result);
+      setReplay((value) => value + 1);
+      const next = new URLSearchParams(searchParams);
+      next.set("run", result.run_id);
+      next.delete("view");
+      setSearchParams(next, { replace: true });
+    } catch (caught) {
+      setError(`Simulation failed: ${messageOf(caught)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (mode === "trace") return <TraceView />;
+
+  return (
+    <>
+      <PageHeader
+        eyebrow="Live architecture"
+        title="Execution Graph"
+        subtitle="Animate the real enforcement path of the latest simulation: allowed data flow advances to the executor, a denial stops at the policy engine. Node states come from recorded audit events, not from the animation."
+        actions={
+          <button
+            type="button"
+            className="btn btn--ghost btn--sm"
+            onClick={() => {
+              const next = new URLSearchParams(searchParams);
+              next.set("view", "trace");
+              setSearchParams(next, { replace: true });
+            }}
+          >
+            Forensic trace
+          </button>
+        }
+      />
+      <PipelineGraph
+        run={run}
+        onRun={() => void runAttack()}
+        busy={busy}
+        error={error}
+        replay={replay}
+      />
     </>
   );
 }
