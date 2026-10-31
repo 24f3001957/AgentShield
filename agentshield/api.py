@@ -18,17 +18,19 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from .approval import ApprovalError
 from .audit import AuditError
 from .evaluation import EvaluationRunner
 from .gateway import Gateway
-from .models import POLICY_VERSION
+from .models import CANONICALIZATION_VERSION, POLICY_VERSION
 
 DEFAULT_DB_PATH = "agentshield.db"
 
@@ -133,6 +135,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
             return JSONResponse(status_code=status, content=response)
         return response
 
+    # -- policy -------------------------------------------------------------
+    @app.get("/policy")
+    def policy() -> dict[str, Any]:
+        """Read-only description of the active policy for the reviewer UI."""
+        return {
+            **gateway.policy.describe(),
+            "canonicalization_version": CANONICALIZATION_VERSION,
+            "tools": gateway.registry(),
+        }
+
     # -- approvals ----------------------------------------------------------
     @app.get("/approvals")
     def list_approvals(state: str | None = None) -> dict[str, Any]:
@@ -232,5 +244,23 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 "Content-Disposition": f'attachment; filename="{row["run_id"]}.json"'
             },
         )
+
+    # -- reviewer UI (optional) ---------------------------------------------
+    # When the frontend has been built (`npm run build` in ./frontend), serve it
+    # from the same origin so one uvicorn process runs the whole demo. API
+    # routes above take precedence; no second execution path is introduced.
+    dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+    if (dist / "index.html").is_file():
+        assets = dist / "assets"
+        if assets.is_dir():
+            app.mount("/assets", StaticFiles(directory=assets), name="ui-assets")
+
+        @app.get("/{full_path:path}", include_in_schema=False)
+        def serve_ui(full_path: str) -> FileResponse:
+            """Serve the built SPA, including client-side routes."""
+            candidate = (dist / full_path).resolve()
+            if full_path and candidate.is_file() and dist.resolve() in candidate.parents:
+                return FileResponse(candidate)
+            return FileResponse(dist / "index.html")
 
     return app

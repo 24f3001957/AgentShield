@@ -62,6 +62,7 @@ class ApprovalRecord:
             "approval_id": self.approval_id,
             "request_id": self.request_id,
             "fingerprint": self.fingerprint,
+            "binding": self.binding,
             "state": self.state,
             "requested_by": self.requested_by,
             "approver": self.approver,

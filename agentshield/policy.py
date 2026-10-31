@@ -386,6 +386,41 @@ class PolicyEngine:
     def __post_init__(self) -> None:
         self.rules: list[Rule] = build_rules(self.config)
 
+    def describe(self) -> dict[str, Any]:
+        """Read-only, reviewable description of the active policy.
+
+        Intended for the reviewer UI: it exposes the ordered rule set, the
+        frozen parameters and the hard-deny codes. It grants nothing and
+        changes nothing - enforcement stays in the gateway.
+        """
+        config = self.config
+        return {
+            "policy_version": self.policy_version,
+            "rule_order": "first-match-wins; every deny rule precedes allow rules",
+            "hard_deny_reason_codes": sorted(HARD_DENY_REASON_CODES),
+            "config": {
+                "approved_destinations": list(config.approved_destinations),
+                "internal_domains": list(config.internal_domains),
+                "internal_roots": list(config.internal_roots),
+                "public_roots": list(config.public_roots),
+                "readable_roots": list(config.readable_roots),
+                "require_approval_for_external_send": (
+                    config.require_approval_for_external_send
+                ),
+                "restricted_roots": list(config.restricted_roots),
+            },
+            "rules": [
+                {
+                    "index": index + 1,
+                    "name": rule.name,
+                    "decision": rule.decision.value,
+                    "reason_code": rule.reason_code,
+                    "explanation": rule.explanation,
+                }
+                for index, rule in enumerate(self.rules)
+            ],
+        }
+
     def evaluate(
         self,
         request: ToolCallRequest | None,

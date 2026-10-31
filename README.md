@@ -52,6 +52,39 @@ uvicorn --factory agentshield.api:create_app --reload
 Then open `http://127.0.0.1:8000/docs`. The database defaults to
 `agentshield.db` in the working directory; override it with `AGENTSHIELD_DB`.
 
+### Run the reviewer console
+
+The console lives in `frontend/` (React + TypeScript + Vite, `@xyflow/react`
+for the execution graph). It reads the gateway API and holds no authority of
+its own.
+
+Development (two processes, hot reload):
+
+```bash
+# terminal 1
+uvicorn --factory agentshield.api:create_app --port 8000
+
+# terminal 2
+cd frontend
+npm install
+npm run dev          # http://127.0.0.1:3000, /api/* proxied to :8000
+```
+
+Single process (what the demo uses): build once, then FastAPI serves the SPA
+at `/` and the API at its normal paths:
+
+```bash
+cd frontend && npm install && npm run build && cd ..
+uvicorn --factory agentshield.api:create_app --port 8000
+# open http://127.0.0.1:8000/
+```
+
+Pages: Dashboard, Execution Graph, Audit Logs, Approvals, Access Control,
+Integrity, Evaluation and an Agent Console for submitting mock calls. The
+console adds the pages and a read-only `GET /policy` view; it introduces **no**
+second execution path, and the policy is deliberately not editable from the UI
+because the backend has no draft/publish endpoint.
+
 ---
 
 ## How a call flows
@@ -294,6 +327,7 @@ They are measurements of that scenario, not benchmark scores.
 | Method & path | Purpose |
 |---|---|
 | `GET /health` | Status, policy version, registered tools |
+| `GET /policy` | Read-only policy rule set, frozen parameters, hard-deny codes, tool registry |
 | `POST /tool-calls` | Submit a tool call (validate → decide → maybe execute) |
 | `GET /tool-calls` / `GET /tool-calls/{id}` | List / inspect a call and its execution |
 | `GET /approvals` | List approvals, filter by `state` |
